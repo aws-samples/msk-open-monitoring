@@ -1,0 +1,9 @@
+{
+  "InstanceType": "kafka.m5.xlarge",
+  "BrokerAZDistribution": "DEFAULT",
+  "ClientSubnets": [
+    "subnet-0dbcdb4b1476c7d0f",
+    "subnet-048aeda3a1ddd8af1",
+    "subnet-0593a7e65d0622e34"
+  ]
+}

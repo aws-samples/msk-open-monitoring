@@ -1,0 +1,420 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  LatestAmiId:
+    Description: Region specific image from the Parameter Store
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  InstanceType:
+    Description: Amazon EC2 instance type for the instances
+    Type: String
+    Default: t3.xlarge
+  Subnets:
+    Description: Subnets for EC2 instances 
+    Type: List<AWS::EC2::Subnet::Id>
+  PrometheusInstallUrl:
+    Type: String
+    Description: The URL of the linux installer for Prometheus
+    Default: https://github.com/prometheus/prometheus/releases/download/v2.26.0/prometheus-2.26.0.linux-amd64.tar.gz
+  NodeExporterInstallUrl:
+    Type: String
+    Description: The URL of the linux Node Exporter for Prometheus
+    Default: https://github.com/prometheus/node_exporter/releases/download/v1.1.2/node_exporter-1.1.2.linux-amd64.tar.gz
+  AMPWorkspaceId:
+    Type: String
+    Description: The AMP workspace ID where we want to remote write Prometheus data
+    MinLength: 10
+    AllowedPattern: "^[a-zA-Z0-9-]+$"
+  AmazonMSKClusterArn:
+    Type: String
+    Description: The Amazon MSK Cluster Arn to scrape metrics
+    Default: arn:aws:kafka:<region>:<accound-id>:cluster/<cluster-name>/<cluster-id>
+
+Resources:
+  PrometheusServerMSKAccessIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:  !Sub "${AWS::StackName}-PrometheusServerMSKAccessIAMRole"
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+        - arn:aws:iam::aws:policy/AmazonPrometheusRemoteWriteAccess
+      Policies:
+        - PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+                - 
+                  Effect: "Allow"
+                  Action: 
+                    - "kafka:Describe*"
+                    - "kafka:Get*"
+                    - "kafka:List*"
+                  Resource: "*"
+
+  
+
+  PrometheusServerMSKAccessIAMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${AWS::StackName}-PrometheusServerMSKAccessIAMInstanceProfile"
+      Path: /
+      Roles:
+        - !Ref PrometheusServerMSKAccessIAMRole
+
+  PrometheusServerLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      LaunchConfigurationName: !Sub "${AWS::StackName}-PrometheusServerLaunchConfiguration"
+      AssociatePublicIpAddress: true
+      IamInstanceProfile: !Ref PrometheusServerMSKAccessIAMInstanceProfile
+      ImageId: !Ref LatestAmiId
+      EbsOptimized: true
+      InstanceMonitoring: true
+      InstanceType: !Ref InstanceType
+      BlockDeviceMappings: 
+          - DeviceName: /dev/sda1
+            Ebs: 
+              VolumeSize: 30
+              VolumeType: "gp2"
+          - DeviceName: /dev/sdm
+            Ebs: 
+              VolumeSize: 100
+              DeleteOnTermination: "false"
+
+  PrometheusServerAutoScalingGroup:
+      Type: AWS::AutoScaling::AutoScalingGroup
+      Properties:
+        AutoScalingGroupName: !Sub "${AWS::StackName}-PrometheusAutoScalingGroup"
+        LaunchConfigurationName: !Ref PrometheusServerLaunchConfig
+        MaxSize: 1
+        MinSize: 0
+        DesiredCapacity: 1
+        VPCZoneIdentifier: !Ref Subnets
+        LifecycleHookSpecificationList:
+          - LifecycleTransition: "autoscaling:EC2_INSTANCE_LAUNCHING"
+            LifecycleHookName: !Sub "${AWS::StackName}PrometheusASGLifecycleHook"
+            HeartbeatTimeout: 4800
+        Tags:
+          - Key: Name
+            Value: Prometheus
+            PropagateAtLaunch: True
+
+  
+  PrometheusScrapeConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${AWS::StackName}-ScrapeConfig"
+      Type: String
+      Value: !Sub |
+        scrape_configs:
+          - job_name: 'node'
+            static_configs:
+              - targets: ['localhost:9100']
+          - job_name: 'broker'
+            file_sd_configs:
+              - files:
+                - 'targets.json'
+        remote_write:
+          - 
+            url: https://aps-workspaces.${AWS::Region}.amazonaws.com/workspaces/${AMPWorkspaceId}/api/v1/remote_write
+            queue_config:
+                max_samples_per_send: 1000
+                max_shards: 200
+                capacity: 2500
+            sigv4:
+                region: ${AWS::Region}
+      Tags: { "Name": !Ref "AWS::StackName" }
+
+  PrometheusServiceConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${AWS::StackName}-ServiceConfig"
+      Type: String
+      Value: |
+        [Unit]
+        Description=Prometheus
+        Wants=network-online.target
+        After=network-online.target
+
+        [Service]
+        User=prometheus
+        Group=prometheus
+        Type=simple
+        ExecStart=/usr/local/bin/prometheus \
+            --config.file /etc/prometheus/prometheus.yml \
+            --storage.tsdb.path /var/lib/prometheus/ \
+            --web.console.templates=/etc/prometheus/consoles \
+            --web.console.libraries=/etc/prometheus/console_libraries
+
+        [Install]
+        WantedBy=multi-user.target
+      Tags: { "Name": !Ref "AWS::StackName" }
+
+  NodeExporterServiceConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${AWS::StackName}-NodeExporter-ServiceConfig"
+      Type: String
+      Value: |
+        [Unit]
+        Description=Node Exporter
+        Wants=network-online.target
+        After=network-online.target
+
+        [Service]
+        User=prometheus
+        Group=prometheus
+        Type=simple
+        ExecStart=/etc/prometheus/node_exporter/node_exporter
+
+        [Install]
+        WantedBy=multi-user.target
+      Tags: { "Name": !Ref "AWS::StackName" }  
+
+
+  PrometheusAutomationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Content:
+        schemaVersion: '2.2'
+        description: 'Installs and configures Prometheus on Linux instances'
+        parameters:
+          PackageUrl:
+            type: 'String'
+            description: 'Prometheus package URL'
+            default: !Ref PrometheusInstallUrl
+          NodeExporterPackageUrl:
+            type: 'String'
+            description: 'Node Exporter package URL'
+            default: !Ref NodeExporterInstallUrl
+          ScrapeConfig:
+            type: 'String'
+            description: 'The Prometheus scrape configuration'
+            default: !Sub '{{ ssm:${PrometheusScrapeConfig} }}'
+          ServiceConfig:
+            type: 'String'
+            description: 'The Prometheus service configuration'
+            default: !Sub '{{ ssm:${PrometheusServiceConfig} }}'
+          NodeExporterServiceConfig:
+            type: 'String'
+            description: 'The Node Exporter service configuration'
+            default: !Sub '{{ ssm:${NodeExporterServiceConfig} }}'
+          MSKClusterArn:
+            type: 'String'
+            description: 'The Cluster Arn for MSK'
+            default: !Ref AmazonMSKClusterArn
+          AWSRegion:
+            type: 'String'
+            description: 'AWS Region'
+            default: !Ref "AWS::Region"
+        mainSteps:
+        - action: 'aws:runShellScript'
+          name: 'InstallPrometheus'
+          inputs:
+            timeoutSeconds: '60'
+            runCommand:
+            - "sudo yum -y install jq"
+            - "echo 'Downloading and extracting Prometheus'"
+            - "sudo systemctl stop prometheus >/dev/null 2>&1"
+            - "wget {{ PackageUrl }} >/dev/null 2>&1"
+            - "tar xfz prometheus-*.tar.gz"
+            - "mv prometheus-*.linux-amd64 prometheus-files"
+            - "rm prometheus-*.tar.gz"
+            - "echo 'Configuring Prometheus'"
+            - "sudo useradd --no-create-home --shell /bin/fase prometheus | >/dev/null 2>&1"
+            - "sudo mkdir -p /etc/prometheus"
+            - "sudo mkdir -p /var/lib/prometheus"
+            - "sudo chown prometheus:prometheus /etc/prometheus"
+            - "sudo chown prometheus:prometheus /var/lib/prometheus"
+            - "sudo cp prometheus-files/prometheus /usr/local/bin/"
+            - "sudo cp prometheus-files/promtool /usr/local/bin/"
+            - "sudo chown prometheus:prometheus /usr/local/bin/prometheus"
+            - "sudo chown prometheus:prometheus /usr/local/bin/promtool"
+            - "sudo cp -r prometheus-files/consoles /etc/prometheus/"
+            - "sudo cp -r prometheus-files/console_libraries/ /etc/prometheus/"
+            - "sudo chown -R prometheus:prometheus /etc/prometheus/consoles/"
+            - "sudo chown -R prometheus:prometheus /etc/prometheus/console_libraries/"
+            - "sudo echo \"{{ ScrapeConfig }}\" > /etc/prometheus/prometheus.yml"
+            - "sudo chown prometheus:prometheus /etc/prometheus/prometheus.yml"
+            - jmx_targets=$(aws kafka list-nodes --cluster-arn {{ MSKClusterArn }} --region {{AWSRegion}} --output json | jq '.[] | [.[].BrokerNodeInfo.Endpoints[0]+":11001"]' | tr "[]" " "|tr -d "\n")
+            - node_targets=$(aws kafka list-nodes --cluster-arn {{ MSKClusterArn }} --region {{AWSRegion}} --output json | jq '.[] | [.[].BrokerNodeInfo.Endpoints[0]+":11002"]' | tr "[]" " "|tr -d "\n")
+            - jq -n --arg jmx_targets  "$jmx_targets" --arg node_targets "$node_targets" "[{\"labels\":{\"job\":\"jmx\"},\"targets\":[$jmx_targets]},{\"labels\":{\"job\":\"node\"},\"targets\":[$node_targets]}]" > /etc/prometheus/targets.json
+            - "sudo chown prometheus:prometheus /etc/prometheus/targets.json"    
+            - "sudo echo \"{{ ServiceConfig }}\" > /etc/systemd/system/prometheus.service"
+            - "echo 'Starting Prometheus service'"
+            - "sudo systemctl daemon-reload"
+            - "sudo systemctl enable prometheus >/dev/null 2>&1"
+            - "sudo systemctl start prometheus"
+            - "rm -rf prometheus-files/"
+            
+            - "echo 'Downloading and configururing Node Exporter'"
+            - "sudo systemctl stop node_exporter >/dev/null 2>&1"
+            - "wget {{ NodeExporterPackageUrl }} >/dev/null 2>&1"
+            - "tar xfz node_exporter-*.tar.gz"
+            - "mv node_exporter-*.linux-amd64 node_exporter"
+            - "sudo rm -rf /etc/prometheus/node_exporter"
+            - "sudo mv node_exporter/ /etc/prometheus/node_exporter/"
+            - "rm node_exporter-*.tar.gz"
+            - "sudo chown -R prometheus:prometheus /etc/prometheus/node_exporter"
+            - "sudo echo \"{{ NodeExporterServiceConfig }}\" > /etc/systemd/system/node_exporter.service"
+            - "sudo systemctl daemon-reload"
+            - "sudo systemctl enable node_exporter >/dev/null 2>&1"
+            - "sudo systemctl start node_exporter"
+      DocumentFormat: YAML
+      DocumentType: Command
+      Name: !Sub ${AWS::StackName}-prometheus-installer
+      Tags: 
+        - Key: Name
+          Value: !Ref "AWS::StackName"
+
+
+  LifecycleEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub "Prometheus-Install-Lifecycle-${AWS::StackName}"
+      EventPattern:
+        source:
+          - aws.autoscaling
+        detail-type:
+          - "EC2 Instance-launch Lifecycle Action"
+        detail:
+          AutoScalingGroupName: 
+            - !Sub "${AWS::StackName}-PrometheusAutoScalingGroup"
+          LifecycleTransition:
+            - "autoscaling:EC2_INSTANCE_LAUNCHING"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt LambdaAutoInstallPrometheus.Arn
+          Id: "LambdaLifecycleFunction"
+
+  LambdaAutoInstallPrometheus:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-AutoInstall-Prometheus"
+      Code:
+        ZipFile:
+          |
+            import json
+            import boto3
+            import time
+            import os
+
+            autoscaling = boto3.client('autoscaling')
+            ssm = boto3.client('ssm')
+
+            def send_lifecycle_action(event, result):
+                try:
+                    response = autoscaling.complete_lifecycle_action(
+                            LifecycleHookName=event['detail']['LifecycleHookName'],
+                            AutoScalingGroupName=event['detail']['AutoScalingGroupName'],
+                            LifecycleActionToken=event['detail']['LifecycleActionToken'],
+                            LifecycleActionResult=result,
+                            InstanceId=event['detail']['EC2InstanceId']
+                        )
+                    print('AutoScaling lifecycle hook completed successfully')
+                except:
+                    print('Error completing lifecycle action')
+                
+
+            def run_command(event):
+                doc_name = os.environ['DOCUMENT_NAME']
+                ec2_instance=event['detail']['EC2InstanceId']
+                
+                attempt = 0
+                while attempt < 10:
+                    attempt = attempt + 1
+                    time.sleep(5 * attempt)
+                    try: 
+                        response = ssm.send_command(
+                            InstanceIds=[ ec2_instance ],
+                            DocumentName=doc_name
+                            )
+                    
+                        if 'Command' in response:
+                            break
+                    except:
+                        print('Error calling send_command. Retrying...')
+                        continue
+                    
+                command_id = response['Command']['CommandId']
+                
+                attempt = 0
+                while attempt < 20:
+                    attempt = attempt + 1
+                    time.sleep(5 * attempt)
+                    result = ssm.get_command_invocation(
+                            CommandId=command_id,
+                            InstanceId=ec2_instance
+                        )
+                    if result['Status'] == 'Success':
+                        print('RunCommand completed successfully!')
+                        break
+
+            def lambda_handler(event, context):
+                run_command(event)
+                send_lifecycle_action(event, 'CONTINUE')
+
+      Handler: "index.lambda_handler"
+      Runtime: python3.7
+      Timeout: 60
+      Environment:
+        Variables:
+          DOCUMENT_NAME: !Ref PrometheusAutomationDocument
+      Role: !GetAtt LambdaAutoInstallPrometheusPermission.Arn
+      Tags:
+        - Key: Name
+          Value: !Ref "AWS::StackName"
+
+
+  LambdaAutoInstallPrometheusPermission:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-LambdaInstall-Prometheus"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - logs:CreateLogGroup
+                Resource: 
+                  - !Sub "arn:aws:logs:us-east-1:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action: 
+                  - autoscaling:CompleteLifecycleAction
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Ref "AWS::StackName"
+
+  PermissionToCallLambdaAutoInstallPrometheus:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaAutoInstallPrometheus.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
